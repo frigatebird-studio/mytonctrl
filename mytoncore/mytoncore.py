@@ -12,6 +12,7 @@ import requests
 from fastcrc import crc16
 
 from modules import MODES
+from modules.btc_teleport import BtcTeleportModule
 from mytoncore.utils import xhex2hex, ng2g
 from mytoncore.liteclient import LiteClient
 from mytoncore.validator_console import ValidatorConsole
@@ -178,6 +179,7 @@ class MyTonCore():
 		seqno = seqno.replace(' ', '')
 		seqno = parse(seqno, '[', ']')
 		seqno = int(seqno)
+		self.local.add_log(f"GetSeqno: seqno is {seqno}", "debug")
 		return seqno
 	#end define
 
@@ -634,10 +636,13 @@ class MyTonCore():
 
 	def GetRootWorkchainEnabledTime(self):
 		self.local.add_log("start GetRootWorkchainEnabledTime function", "debug")
-		config12 = self.GetConfig(12)
-		enabledTime = config12["workchains"]["root"]["node"]["value"]["enabled_since"]
+		enabledTime = self.get_basechain_config()["enabled_since"]
 		return enabledTime
 	#end define
+
+	def get_basechain_config(self):
+		config12 = self.GetConfig(12)
+		return config12["workchains"]["root"]["node"]["value"]
 
 	def GetTotalValidators(self):
 		self.local.add_log("start GetTotalValidators function", "debug")
@@ -817,7 +822,7 @@ class MyTonCore():
 			status.out_of_sync = status.masterchain_out_of_sync if status.masterchain_out_of_sync > status.shardchain_out_of_sync else status.shardchain_out_of_sync
 			status.out_of_ser = status.masterchain_out_of_ser
 			status.last_deleted_mc_state = int(parse(result, "last_deleted_mc_state", '\n'))
-			status.stateserializerenabled = parse(result, "stateserializerenabled", '\n') == "true"
+			status.stateserializerenabled = parse(result, "stateserializerenabled", '\n').strip() == "true"
 			self.local.try_function(self.parse_stats_from_vc, args=[result, status])
 			if 'active_validator_groups' in status:
 				groups = status.active_validator_groups.split()  # master:1 shard:2
@@ -929,11 +934,11 @@ class MyTonCore():
 		return config32
 	#end define
 
-	def GetConfig34(self):
+	def GetConfig34(self, no_cache: bool = False):
 		# Get buffer
 		bname = "config34"
-		buff = self.GetFunctionBuffer(bname, timeout=60)
-		if buff:
+		buff = self.GetFunctionBuffer(bname, timeout=10)
+		if buff and not no_cache:
 			return buff
 		#end if
 
@@ -1178,7 +1183,7 @@ class MyTonCore():
 		if bounceable == False and destAccount.status == "active":
 			flags += ["--force-bounce"]
 			text = "Find non-bounceable flag, but destination account already active. Using bounceable flag"
-			self.local.AddLog(text, "warning")
+			self.local.add_log(text, "warning")
 		elif "-n" not in flags and bounceable == True and destAccount.status != "active":
 			raise Exception("Find bounceable flag, but destination account is not active. Use non-bounceable address or flag -n")
 		#end if
@@ -1221,11 +1226,17 @@ class MyTonCore():
 				self.liteClient.Run("sendfile " + filePath, useLocalLiteServer=False)
 			except: pass
 		if duplicateApi:
-			self.send_boc_toncenter(filePath)
+			try:
+				self.send_boc_toncenter(filePath)
+			except Exception as e:
+				self.local.add_log(f'Failed to send file {filePath} to toncenter: {e}', 'warning')
 		if timeout and wallet:
 			self.WaitTransaction(wallet, timeout)
-		if remove == True:
-			os.remove(filePath)
+		if remove:
+			try:
+				os.remove(filePath)
+			except Exception as e:
+				self.local.add_log(f'Failed to remove file {filePath}: {e}', 'warning')
 	#end define
 
 	def send_boc_toncenter(self, file_path: str):
@@ -1445,6 +1456,7 @@ class MyTonCore():
 
 		# Create keys
 		validatorKey = self.GetValidatorKeyByTime(startWorkTime, endWorkTime)
+		self.AddKeyToTemp(validatorKey, endWorkTime) # add one more time to ensure it is in temp keys
 		validatorPubkey_b64  = self.GetPubKeyBase64(validatorKey)
 
 		# Attach ADNL addr to validator
@@ -1698,10 +1710,10 @@ class MyTonCore():
 		subwallet_default = 698983191 + workchain # 0x29A9A317 + workchain
 		subwallet = kwargs.get("subwallet", subwallet_default)
 		version = kwargs.get("version", "hv1")
-		self.local.AddLog("start CreateHighWallet function", "debug")
+		self.local.add_log("start CreateHighWallet function", "debug")
 		wallet_path = self.walletsDir + name
 		if os.path.isfile(wallet_path + ".pk") and os.path.isfile(wallet_path + str(subwallet) + ".addr"):
-			self.local.AddLog("CreateHighWallet error: Wallet already exists: " + name + str(subwallet), "warning")
+			self.local.add_log("CreateHighWallet error: Wallet already exists: " + name + str(subwallet), "warning")
 		else:
 			args = ["new-highload-wallet.fif", workchain, subwallet, wallet_path]
 			result = self.fift.Run(args)
@@ -2272,23 +2284,23 @@ class MyTonCore():
 		return fileName
 	#end define
 
-	def VoteOffer(self, offerHash):
+	def VoteOffer(self, offer):
 		self.local.add_log("start VoteOffer function", "debug")
-		fullConfigAddr = self.GetFullConfigAddr()
+		full_config_addr = self.GetFullConfigAddr()
 		wallet = self.GetValidatorWallet(mode="vote")
-		validatorKey = self.GetValidatorKey()
-		validatorPubkey_b64 = self.GetPubKeyBase64(validatorKey)
-		validatorIndex = self.GetValidatorIndex()
-		offer = self.GetOffer(offerHash)
-		if validatorIndex in offer.get("votedValidators"):
+		validator_key = self.GetValidatorKey()
+		validator_pubkey_b64 = self.GetPubKeyBase64(validator_key)
+		validator_index = self.GetValidatorIndex()
+		offer_hash = offer.get("hash")
+		if validator_index in offer.get("votedValidators"):
 			self.local.add_log("Proposal already has been voted", "debug")
 			return
 		self.add_save_offer(offer)
-		var1 = self.CreateConfigProposalRequest(offerHash, validatorIndex)
-		validatorSignature = self.GetValidatorSignature(validatorKey, var1)
-		resultFilePath = self.SignProposalVoteRequestWithValidator(offerHash, validatorIndex, validatorPubkey_b64, validatorSignature)
-		resultFilePath = self.SignBocWithWallet(wallet, resultFilePath, fullConfigAddr, 1.5)
-		self.SendFile(resultFilePath, wallet)
+		var1 = self.CreateConfigProposalRequest(offer_hash, validator_index)
+		validator_signature = self.GetValidatorSignature(validator_key, var1)
+		result_file_path = self.SignProposalVoteRequestWithValidator(offer_hash, validator_index, validator_pubkey_b64, validator_signature)
+		result_file_path = self.SignBocWithWallet(wallet, result_file_path, full_config_addr, 1.5)
+		self.SendFile(result_file_path, wallet, remove=False)
 	#end define
 
 	def VoteComplaint(self, electionId, complaintHash):
@@ -2384,9 +2396,8 @@ class MyTonCore():
 				self.local.add_log(f"complaint {complaint['hash_hex']} declined: complaint info was not found, probably it's wrong", "info")
 				continue
 
-			if (vload["id"] >= config32['mainValidators'] and
-				vload["masterBlocksCreated"] + vload["workBlocksCreated"] > 0):
-				self.local.add_log(f"complaint {complaint['hash_hex']} declined: complaint created for non masterchain validator that created more than zero blocks", "info")
+			if vload["id"] >= config32['mainValidators']:
+				self.local.add_log(f"complaint {complaint['hash_hex']} declined: complaint created for non masterchain validator", "info")
 				continue
 
 			# check complaint fine value
@@ -2511,7 +2522,7 @@ class MyTonCore():
 			end = timestamp - 60
 		if start is None:
 			if fast:
-				start = end - 1000
+				start = max(end - 1000, config.get("startWorkTime"))
 			else:
 				start = config.get("startWorkTime")
 		if past:
@@ -2587,7 +2598,7 @@ class MyTonCore():
 			pseudohash = pubkey + str(electionId)
 			if pseudohash in valid_complaints or pseudohash in voted_complaints_pseudohashes:  # do not create complaints that already created or voted by ourself
 				continue
-			if item['id'] >= config['mainValidators'] and item["masterBlocksCreated"] + item["workBlocksCreated"] > 0:  # create complaints for non-masterchain validators only if they created 0 blocks
+			if item['id'] >= config['mainValidators']:  # do not create complaints for non-masterchain validators
 				continue
 			# Create complaint
 			fileName = self.remove_proofs_from_complaint(fileName)
@@ -2597,11 +2608,12 @@ class MyTonCore():
 			self.local.add_log("var1: {}, var2: {}, pubkey: {}, election_id: {}".format(var1, var2, pubkey, electionId), "debug")
 	#end define
 
-	def GetOffer(self, offerHash):
+	def GetOffer(self, offer_hash: str, offers: list = None):
 		self.local.add_log("start GetOffer function", "debug")
-		offers = self.GetOffers()
+		if offers is None:
+			offers = self.GetOffers()
 		for offer in offers:
-			if offerHash == offer.get("hash"):
+			if offer_hash == offer.get("hash"):
 				return offer
 		raise Exception("GetOffer error: offer not found.")
 	#end define
@@ -2871,9 +2883,11 @@ class MyTonCore():
 			if offer_hash not in current_offers_hashes:
 				if isinstance(offer, list):
 					param_id = offer[1]
-					if param_id is not None and offer[0] != self.calculate_offer_pseudohash(offer_hash, param_id):
+					phash = self.calculate_offer_pseudohash(offer_hash, param_id)
+					if param_id is not None and offer[0] != phash:
 						# param has been changed so no need to keep anymore
 						save_offers.pop(offer_hash)
+						self.local.add_log(f"Removing offer {offer_hash} from save_offers. Saved phash: {offer[0]}, now phash: {phash}", "debug")
 				else:  # old version of offer in db
 					save_offers.pop(offer_hash)
 		return save_offers
@@ -2884,7 +2898,6 @@ class MyTonCore():
 		if save_offers is None or isinstance(save_offers, list):
 			save_offers = dict()
 			self.local.db[bname] = save_offers
-		self.offers_gc(save_offers)
 		return save_offers
 	#end define
 
@@ -3061,17 +3074,17 @@ class MyTonCore():
 		stats = self.local.db.get('statistics', {}).get('node')
 		result = {}
 		if stats is not None and len(stats) == 3 and stats[0] is not None:
-			for k in ['master', 'shard']:
-				result = {
-					'collated': {
-						'ok': 0,
-						'error': 0,
-					},
-					'validated': {
-						'ok': 0,
-						'error': 0,
-					}
+			result = {
+				'collated': {
+					'ok': 0,
+					'error': 0,
+				},
+				'validated': {
+					'ok': 0,
+					'error': 0,
 				}
+			}
+			for k in ['master', 'shard']:
 				collated_ok = stats[2]['collated_blocks'][k]['ok'] - stats[0]['collated_blocks'][k]['ok']
 				collated_error = stats[2]['collated_blocks'][k]['error'] - stats[0]['collated_blocks'][k]['error']
 				validated_ok = stats[2]['validated_blocks'][k]['ok'] - stats[0]['validated_blocks'][k]['ok']
@@ -3088,7 +3101,7 @@ class MyTonCore():
 				result['collated']['error'] += collated_error
 				result['validated']['ok'] += validated_ok
 				result['validated']['error'] += validated_error
-		if stats is not None and len(stats) >= 2 and stats[0] is not None:
+		if stats is not None and len(stats) >= 2 and stats[-2] is not None and stats[-1] is not None:
 			result['ls_queries'] = {
 				'ok': stats[-1]['ls_queries']['ok'] - stats[-2]['ls_queries']['ok'],
 				'error': stats[-1]['ls_queries']['error'] - stats[-2]['ls_queries']['error'],
@@ -3150,6 +3163,7 @@ class MyTonCore():
 			if self.using_liteserver():
 				raise Exception(f'Cannot enable validator mode while liteserver mode is enabled. '
 								f'Use `disable_mode liteserver` first.')
+			BtcTeleportModule(self, self.local).init()
 		if name == 'liquid-staking':
 			from mytoninstaller.settings import enable_ton_http_api
 			enable_ton_http_api(self.local)
@@ -3157,7 +3171,7 @@ class MyTonCore():
 	def enable_mode(self, name):
 		if name not in MODES:
 			raise Exception(f'Unknown module name: {name}. Available modes: {", ".join(MODES)}')
-		self.check_enable_mode(name)
+		MODES[name].check_enable(self)
 		current_modes = self.get_modes()
 		current_modes[name] = True
 		self.local.save()
@@ -3166,6 +3180,7 @@ class MyTonCore():
 		current_modes = self.get_modes()
 		if name not in current_modes:
 			raise Exception(f'Unknown module name: {name}. Available modes: {", ".join(MODES)}')
+		MODES[name](self, self.local).check_disable()
 		current_modes[name] = False
 		self.local.save()
 
@@ -3193,6 +3208,17 @@ class MyTonCore():
 	def using_liteserver(self):
 		return self.get_mode_value('liteserver')
 
+	def using_collator(self):
+		return self.get_mode_value('collator')
+
+	def get_node_mode(self):
+		if self.using_validator():
+			return 'VALIDATOR'
+		elif self.using_liteserver():
+			return 'LITESERVER'
+		elif self.using_collator():
+			return 'COLLATOR'
+
 	def using_alert_bot(self):
 		return self.get_mode_value('alert-bot')
 
@@ -3206,12 +3232,15 @@ class MyTonCore():
 		self.local.db.pop('initialSync', None)
 		self.local.save()
 
-	def Tlb2Json(self, text):
+	def Tlb2Json(self, text: str):
 		# Заменить скобки
 		start = 0
 		end = len(text)
 		if '=' in text:
 			start = text.find('=')+1
+		if text[start:].startswith(' x{'):  # param has no tlb scheme, return cell value
+			end = text.rfind('}')+1
+			return {'_': text[start:end].strip()}
 		if "x{" in text:
 			end = text.find("x{")
 		text = text[start:end]

@@ -1,3 +1,5 @@
+import os
+import pwd
 import subprocess
 import time
 
@@ -5,6 +7,8 @@ from mypylib.mypylib import bcolors
 
 
 def timestamp2utcdatetime(timestamp, format="%d.%m.%Y %H:%M:%S"):
+    if timestamp is None:
+        return "n/a"
     datetime = time.gmtime(timestamp)
     result = time.strftime(format, datetime) + ' UTC'
     return result
@@ -55,3 +59,19 @@ def GetColorInt(data, border, logic, ending=None):
             result = bcolors.red_text(data, ending)
     return result
 # end define
+
+def get_current_user():
+    return pwd.getpwuid(os.getuid()).pw_name
+
+def pop_arg_from_args(args: list, arg_name: str):
+    if arg_name in args:
+        arg_index = args.index(arg_name) + 1
+        if arg_index >= len(args):
+            raise Exception(f'Value not found after "{arg_name}" in args: {args}')
+        value = args.pop(arg_index)
+        args.pop(args.index(arg_name))
+        return value
+    return None
+
+def pop_user_from_args(args: list):
+    return pop_arg_from_args(args, '-u')

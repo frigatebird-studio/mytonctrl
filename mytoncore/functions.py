@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf_8 -*-l
+import datetime
 import os
 import sys
 import psutil
@@ -9,6 +10,7 @@ import base64
 import requests
 import subprocess
 
+from mypylib import MyPyClass
 from mytoncore.mytoncore import MyTonCore
 from mytonctrl.utils import fix_git_config
 from mytoninstaller.config import GetConfig
@@ -53,10 +55,12 @@ def Event(local, event_name):
         EnableVcEvent(local)
     elif event_name == "validator down":
         ValidatorDownEvent(local)
-    elif event_name == "enable_ton_storage_provider":
-        enable_ton_storage_provider_event(local)
     elif event_name.startswith("enable_mode"):
         enable_mode(local, event_name)
+    elif event_name == "enable_btc_teleport":
+        enable_btc_teleport(local)
+    elif event_name.startswith("setup_collator"):
+        setup_collator(local, event_name)
     local.exit()
 # end define
 
@@ -84,22 +88,30 @@ def ValidatorDownEvent(local):
 # end define
 
 
-def enable_ton_storage_provider_event(local):
-    config_path = local.db.ton_storage.provider.config_path
-    config = GetConfig(path=config_path)
-    key_bytes = base64.b64decode(config.ProviderKey)
-    ton = MyTonCore(local)
-    ton.import_wallet_with_version(key_bytes[:32], version="v3r2", wallet_name="provider_wallet_001")
-#end define
-
-
-def enable_mode(local, event_name):
+def enable_mode(local, event_name: str):
     ton = MyTonCore(local)
     mode = event_name.split("_")[-1]
-    if mode == "liteserver":
+    if mode in ("liteserver", "collator"):
         ton.disable_mode('validator')
     ton.enable_mode(mode)
 #end define
+
+def enable_btc_teleport(local):
+    local.add_log("start enable_btc_teleport function", "debug")
+    ton = MyTonCore(local)
+    if not ton.using_validator():
+        local.add_log("Skip installing BTC Teleport as node is not a validator", "info")
+        return
+    from modules.btc_teleport import BtcTeleportModule
+    BtcTeleportModule(ton, local).init(reinstall=True)
+
+
+def setup_collator(local, event_name: str):
+    local.add_log("start setup_collator function", "debug")
+    ton = MyTonCore(local)
+    from modules.collator import CollatorModule
+    shards = event_name.split("_")[2:]
+    CollatorModule(ton, local).setup_collator(shards)
 
 
 def Elections(local, ton):
@@ -323,25 +335,35 @@ def save_node_statistics(local, ton):
                 data['ls_queries']['error'] = int(k.split(':')[1])
     statistics = local.db.get("statistics", dict())
 
-    if time.time() - int(status.start_time) <= 60:  # was node restart <60 sec ago, resetting node statistics
+    # if time.time() - int(status.start_time) <= 60:  # was node restart <60 sec ago, resetting node statistics
+    #     statistics['node'] = []
+
+    if 'node' not in statistics:
         statistics['node'] = []
 
-    # statistics['node'] = [stats_from_election_id, stats_from_prev_min, stats_now]
+    if statistics['node']:
+        if int(status.start_time) > statistics['node'][-1]['timestamp']:
+            # node was restarted, reset node statistics
+            statistics['node'] = []
 
-    election_id = ton.GetConfig34()['startWorkTime']
-    if 'node' not in statistics or len(statistics['node']) == 0:
+    # statistics['node']: [stats_from_election_id, stats_from_prev_min, stats_now]
+
+    election_id = ton.GetConfig34(no_cache=True)['startWorkTime']
+    if len(statistics['node']) == 0:
         statistics['node'] = [None, data]
     elif len(statistics['node']) < 3:
         statistics['node'].append(data)
-    if len(statistics['node']) == 3:
+    elif len(statistics['node']) == 3:
         if statistics['node'][0] is None:
             if 0 < data['timestamp'] - election_id < 90:
                 statistics['node'][0] = data
         elif statistics['node'][0]['timestamp'] < election_id:
             statistics['node'][0] = data
-        statistics['node'] = statistics.get('node', []) + [data]
-        statistics['node'].pop(1)
+        temp = statistics.get('node', []) + [data]
+        temp.pop(1)
+        statistics['node'] = temp
     local.db["statistics"] = statistics
+    local.save()
 
 
 def ReadTransData(local, scanner):
@@ -430,6 +452,10 @@ def GetBlockTimeAvg(local, timediff):
 
 def Offers(local, ton):
     save_offers = ton.GetSaveOffers()
+    if save_offers:
+        ton.offers_gc(save_offers)
+    else:
+        return
     offers = ton.GetOffers()
     for offer in offers:
         offer_hash = offer.get("hash")
@@ -441,7 +467,7 @@ def Offers(local, ton):
             else:  # old version of save offers {"hash": "pseudohash"}
                 save_offer_pseudohash = save_offer
             if offer_pseudohash == save_offer_pseudohash and offer_pseudohash is not None:
-                ton.VoteOffer(offer_hash)
+                ton.VoteOffer(offer)
 # end define
 
 def Telemetry(local, ton):
@@ -469,6 +495,7 @@ def Telemetry(local, ton):
     data["vprocess"] = GetValidatorProcessInfo()
     data["dbStats"] = local.try_function(get_db_stats)
     data["nodeArgs"] = local.try_function(get_node_args)
+    data["modes"] = local.try_function(ton.get_modes)
     data["cpuInfo"] = {'cpuName': local.try_function(get_cpu_name), 'virtual': local.try_function(is_host_virtual)}
     data["validatorDiskName"] = local.try_function(get_validator_disk_name)
     data["pings"] = local.try_function(get_pings_values)
@@ -613,6 +640,61 @@ def check_initial_sync(local, ton):
         return
 
 
+def gc_import(local, ton):
+    if not ton.local.db.get('importGc', False):
+        return
+    local.add_log("GC import is running", "debug")
+    import_path = '/var/ton-work/db/import'
+    files = os.listdir(import_path)
+    if not files:
+        local.add_log("No files left to import", "debug")
+        ton.local.db['importGc'] = False
+        return
+    try:
+        status = ton.GetValidatorStatus()
+        node_seqno = int(status.shardclientmasterchainseqno)
+    except Exception as e:
+        local.add_log(f"Failed to get shardclientmasterchainseqno: {e}", "warning")
+        return
+    removed = 0
+    for file in files:
+        file_seqno = int(file.split('.')[1])
+        if node_seqno > file_seqno + 101:
+            try:
+                os.remove(os.path.join(import_path, file))
+                removed += 1
+            except PermissionError:
+                local.add_log(f"Failed to remove file {file}: Permission denied", "error")
+                continue
+    local.add_log(f"Removed {removed} import files up to {node_seqno} seqno", "debug")
+
+
+def backup_mytoncore_logs(local: MyPyClass, ton: MyTonCore):
+    logs_path = os.path.join(ton.tempDir, 'old_logs')
+    os.makedirs(logs_path, exist_ok=True)
+    for file in os.listdir(logs_path):
+        file_path = os.path.join(logs_path, file)
+        if time.time() - os.path.getmtime(file_path) < 3600:  # check that last file was created not less than an hour ago
+            return
+    now = datetime.datetime.now().strftime("%Y_%m_%d_%H_%M_%S")
+    log_backup_tmp_path = os.path.join(logs_path, 'mytoncore_log_' + now + '.log')
+    subprocess.run(["cp", local.buffer.log_file_name, log_backup_tmp_path])
+    ton.clear_dir(logs_path)
+
+
+def check_mytoncore_db(local: MyPyClass, ton: MyTonCore):
+    try:
+        local.read_db(local.buffer.db_path)
+        backup_path = local.buffer.db_path + ".backup"
+        if not os.path.isfile(backup_path) or time.time() - os.path.getmtime(backup_path) > 3600*6:
+            ton.create_self_db_backup()
+        return
+    except Exception as e:
+        print(f'Failed to read mytoncore db: {e}')
+        local.add_log(f"Failed to read mytoncore db: {e}", "error")
+    ton.CheckConfigFile(None, None)  # get mytoncore db from backup
+
+
 def General(local):
     local.add_log("start General function", "debug")
     ton = MyTonCore(local)
@@ -623,6 +705,9 @@ def General(local):
     local.start_cycle(Statistics, sec=10, args=(local, ))
     local.start_cycle(Telemetry, sec=60, args=(local, ton, ))
     local.start_cycle(OverlayTelemetry, sec=7200, args=(local, ton, ))
+    local.start_cycle(backup_mytoncore_logs, sec=3600*4, args=(local, ton, ))
+    local.start_cycle(check_mytoncore_db, sec=600, args=(local, ton, ))
+
     if local.db.get("onlyNode"):  # mytoncore service works only for telemetry
         thr_sleep()
         return
@@ -650,8 +735,14 @@ def General(local):
     from modules.prometheus import PrometheusModule
     local.start_cycle(PrometheusModule(ton, local).push_metrics, sec=30, args=())
 
+    from modules.btc_teleport import BtcTeleportModule
+    local.start_cycle(BtcTeleportModule(ton, local).auto_vote_offers, sec=180, args=())
+
     if ton.in_initial_sync():
         local.start_cycle(check_initial_sync, sec=120, args=(local, ton))
+
+    if ton.local.db.get('importGc'):
+        local.start_cycle(gc_import, sec=300, args=(local, ton))
 
     thr_sleep()
 # end define

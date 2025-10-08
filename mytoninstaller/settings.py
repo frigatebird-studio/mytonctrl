@@ -1,5 +1,9 @@
+import datetime
 import os
 import os.path
+import time
+import typing
+
 import psutil
 import base64
 import subprocess
@@ -7,6 +11,8 @@ import requests
 import random
 import json
 import pkg_resources
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 from mypylib.mypylib import (
 	add2systemd,
@@ -16,7 +22,9 @@ from mypylib.mypylib import (
 	ip2int,
 	Dict, int2ip
 )
-from mytoninstaller.utils import StartValidator, StartMytoncore, start_service, stop_service, get_ed25519_pubkey
+from mytonctrl.utils import get_current_user
+from mytoninstaller.utils import StartValidator, StartMytoncore, start_service, stop_service, get_ed25519_pubkey, \
+	disable_service, is_testnet, get_block_from_toncenter
 from mytoninstaller.config import SetConfig, GetConfig, get_own_ip, backup_config
 from mytoncore.utils import hex2b64
 
@@ -37,11 +45,18 @@ def FirstNodeSettings(local):
 	validatorAppPath = local.buffer.validator_app_path
 	globalConfigPath = local.buffer.global_config_path
 	vconfig_path = local.buffer.vconfig_path
+	vport = local.buffer.vport
 
-	if os.getenv('ARCHIVE_TTL'):
-		archive_ttl = int(os.getenv('ARCHIVE_TTL'))
+	if local.buffer.archive_ttl is not None:
+		archive_ttl = int(local.buffer.archive_ttl)
 	else:
 		archive_ttl = 2592000 if local.buffer.mode == 'liteserver' else 86400
+	state_ttl = None
+	if local.buffer.state_ttl is not None:
+		state_ttl = int(local.buffer.state_ttl)
+		archive_ttl -= state_ttl
+	if archive_ttl == 0:
+		archive_ttl = 1  # todo: remove this when archive_ttl==0 will be allowed in node
 
 	# Проверить конфигурацию
 	if os.path.isfile(vconfig_path):
@@ -65,19 +80,31 @@ def FirstNodeSettings(local):
 
 	# Прописать автозагрузку
 	cpus = psutil.cpu_count() - 1
-	cmd = f"{validatorAppPath} --threads {cpus} --daemonize --global-config {globalConfigPath} --db {ton_db_dir} --logname {tonLogPath} --archive-ttl {archive_ttl} --verbosity 1"
 
-	if os.getenv('ADD_SHARD'):
-		add_shard = os.getenv('ADD_SHARD')
+	ttl_cmd = ''
+	if archive_ttl == -1:
+		archive_ttl = 10**9
+		state_ttl = 10**9
+		ttl_cmd += f' --permanent-celldb'
+	if state_ttl is not None:
+		ttl_cmd += f' --state-ttl {state_ttl}'
+	ttl_cmd += f' --archive-ttl {archive_ttl}'
+
+	cmd = f"{validatorAppPath} --threads {cpus} --daemonize --global-config {globalConfigPath} --db {ton_db_dir} --logname {tonLogPath} --verbosity 1"
+	cmd += ttl_cmd
+
+	if local.buffer.add_shard is not None:
+		add_shard = local.buffer.add_shard
 		cmd += f' -M'
 		for shard in add_shard.split():
 			cmd += f' --add-shard {shard}'
 
 	add2systemd(name="validator", user=vuser, start=cmd, pre='/bin/sleep 2') # post="/usr/bin/python3 /usr/src/mytonctrl/mytoncore.py -e \"validator down\""
 
-	# Получить внешний ip адрес
-	ip = get_own_ip()
-	vport = random.randint(2000, 65000)
+	if local.buffer.public_ip is not None:
+		ip = local.buffer.public_ip
+	else:
+		ip = get_own_ip()
 	addr = "{ip}:{vport}".format(ip=ip, vport=vport)
 	local.add_log("Use addr: " + addr, "debug")
 
@@ -86,8 +113,8 @@ def FirstNodeSettings(local):
 	args = [validatorAppPath, "--global-config", globalConfigPath, "--db", ton_db_dir, "--ip", addr, "--logname", tonLogPath]
 	subprocess.run(args)
 
-	# Скачать дамп
 	DownloadDump(local)
+	download_archive_from_ts(local)
 
 	# chown 1
 	local.add_log("Chown ton-work dir", "debug")
@@ -98,13 +125,209 @@ def FirstNodeSettings(local):
 	StartValidator(local)
 #end define
 
-def is_testnet(local):
-	testnet_zero_state_root_hash = "gj+B8wb/AmlPk1z1AhVI484rhrUpgSr2oSFIh56VoSg="
-	with open(local.buffer.global_config_path) as f:
+def download_blocks(local, bag: dict, downloads_path: str):
+	local.add_log(f"Downloading blocks from {bag['from']} to {bag['to']}", "info")
+	if not download_bag(local, bag['bag'], downloads_path):
+		local.add_log("Error downloading archive bag", "error")
+		return
+
+
+def download_master_blocks(local, bag: dict, downloads_path: str):
+	local.add_log(f"Downloading master blocks from {bag['from']} to {bag['to']}", "info")
+	if not download_bag(local, bag['bag'], downloads_path, download_all=False, download_file=lambda f: ':' not in f['name']):
+		local.add_log("Error downloading master bag", "error")
+		return
+
+
+def download_bag(local, bag_id: str, downloads_path: str, download_all: bool = True, download_file: typing.Callable = None):
+	indexes = []
+	local_ts_url = f"http://127.0.0.1:{local.buffer.ton_storage.api_port}"
+
+	resp = requests.post(local_ts_url + '/api/v1/add', json={'bag_id': bag_id, 'download_all': download_all, 'path': downloads_path})
+	if not resp.json()['ok']:
+		local.add_log("Error adding bag: " + resp.json(), "error")
+		return False
+	resp = requests.get(local_ts_url + f'/api/v1/details?bag_id={bag_id}').json()
+	if not download_all:
+		while not resp['header_loaded']:
+			time.sleep(1)
+			resp = requests.get(local_ts_url + f'/api/v1/details?bag_id={bag_id}').json()
+		for f in resp['files']:
+			if download_file(f):
+				indexes.append(f['index'])
+		resp = requests.post(local_ts_url + '/api/v1/add', json={'bag_id': bag_id, 'download_all': download_all, 'path': downloads_path, 'files': indexes})
+		if not resp.json()['ok']:
+			local.add_log("Error adding bag: " + resp.json(), "error")
+			return False
+		time.sleep(3)
+		resp = requests.get(local_ts_url + f'/api/v1/details?bag_id={bag_id}').json()
+	while not resp['completed']:
+		if resp['size'] == 0:
+			local.add_log(f"STARTING DOWNLOADING {bag_id}", "debug")
+			time.sleep(20)
+			resp = requests.get(local_ts_url + f'/api/v1/details?bag_id={bag_id}').json()
+			continue
+		text = f'DOWNLOADING {bag_id} {round((resp["downloaded"] / resp["size"]) * 100)}% ({resp["downloaded"] / 10**6} / {resp["size"] / 10**6} MB), speed: {resp["download_speed"] / 10**6} MB/s'
+		local.add_log(text, "debug")
+		time.sleep(20)
+		resp = requests.get(local_ts_url + f'/api/v1/details?bag_id={bag_id}').json()
+	local.add_log(f"DOWNLOADED {bag_id}", "debug")
+	requests.post(local_ts_url + '/api/v1/remove', json={'bag_id': bag_id, 'with_files': False})
+	return True
+
+
+def update_init_block(local, seqno: int):
+	local.add_log(f"Editing init block in {local.buffer.global_config_path}", "info")
+	with open(local.buffer.global_config_path, 'r') as f:
 		config = json.load(f)
-	if config['validator']['zero_state']['root_hash'] == testnet_zero_state_root_hash:
-		return True
-	return False
+	if seqno != 0:
+		data = get_block_from_toncenter(local, workchain=-1, seqno=seqno)
+	else:
+		data = config['validator']['zero_state']
+	config['validator']['init_block']['seqno'] = seqno
+	config['validator']['init_block']['file_hash'] = data['file_hash']
+	config['validator']['init_block']['root_hash'] = data['root_hash']
+	with open(local.buffer.global_config_path, 'w') as f:
+		f.write(json.dumps(config, indent=4))
+	return True
+
+
+def parse_block_value(local, block: str):
+	if block is None:
+		return None
+	if block.isdigit():
+		return int(block)
+	dt = datetime.datetime.strptime(block, "%Y-%m-%d")
+	ts = int(dt.timestamp())
+	data = get_block_from_toncenter(local, workchain=-1, utime=ts)
+	return int(data['seqno'])
+
+
+def download_archive_from_ts(local):
+	if local.buffer.archive_blocks is None:
+		return
+	archive_blocks = local.buffer.archive_blocks
+	downloads_path = '/var/ton-work/ts-downloads/'
+	os.makedirs(downloads_path, exist_ok=True)
+	subprocess.run(["chmod", "o+wx", downloads_path])
+
+	block_from, block_to = archive_blocks, None
+	if len(archive_blocks.split()) > 1:
+		block_from, block_to = archive_blocks.split()
+	block_from, block_to = parse_block_value(local, block_from), parse_block_value(local, block_to)
+	block_from = max(1, block_from - 100)  # to download previous package as node may require some blocks from it
+
+	enable_ton_storage(local)
+	url = 'https://archival-dump.ton.org/index/mainnet.json'
+	if is_testnet(local):
+		url = 'https://archival-dump.ton.org/index/testnet.json'
+
+	state_bag = {}
+	block_bags = []
+	master_block_bags = []
+
+	blocks_config = requests.get(url, timeout=3).json()
+	for state in blocks_config['states']:
+		if state['at_block'] > block_from:
+			break
+		state_bag = state
+	block_from = state_bag['at_block']
+	completed = False
+	for block in blocks_config['blocks']:
+		if completed:
+			master_block_bags.append(block)
+			continue
+		if block_to is not None and block['from'] > block_to:
+			completed = True
+			master_block_bags.append(block)
+			continue
+		if block['to'] >= block_from:
+			block_bags.append(block)
+
+	if not state_bag or not block_bags:
+		local.add_log("Skip downloading archive blocks: No bags found for the specified block", "error")
+		return
+
+	local.add_log(f"Downloading blockchain state for block {state_bag['at_block']}", "info")
+	if not download_bag(local, state_bag['bag'], downloads_path):
+		local.add_log("Error downloading state bag", "error")
+		return
+
+
+	update_init_block(local, state_bag['at_block'])
+	estimated_size = len(block_bags) * 4 * 2**30 + len(master_block_bags) * 4 * 2**30 * 0.2  # 4 GB per bag, 20% for master blocks
+
+	local.add_log(f"Downloading archive blocks. Rough estimate total blocks size is {int(estimated_size / 2**30)} GB", "info")
+	with ThreadPoolExecutor(max_workers=4) as executor:
+		futures = [executor.submit(download_blocks, local, bag, downloads_path) for bag in block_bags]
+		futures += [executor.submit(download_master_blocks, local, bag, downloads_path) for bag in master_block_bags]
+		for future in as_completed(futures):
+			try:
+				future.result()
+			except Exception as e:
+				local.add_log(f"Error while downloading blocks: {e}", "error")
+				return
+
+	local.add_log(f"Downloading blocks is completed, moving files", "info")
+
+	archive_dir = local.buffer.ton_db_dir + 'archive/'
+	import_dir = local.buffer.ton_db_dir + 'import/'
+	os.makedirs(import_dir, exist_ok=True)
+	states_dir = archive_dir + '/states'
+
+	os.makedirs(states_dir, exist_ok=True)
+	os.makedirs(import_dir, exist_ok=True)
+
+	subprocess.run(f'mv {downloads_path}/{state_bag["bag"]}/state-*/* {states_dir}', shell=True)
+	# subprocess.run(['rm', '-rf', f"{downloads_path}/{state_bag['bag']}"])
+	for bag in block_bags + master_block_bags:
+		subprocess.run(f'mv {downloads_path}/{bag["bag"]}/*/*/* {import_dir}', shell=True)
+		# subprocess.run(['rm', '-rf', f"{downloads_path}/{bag['bag']}"])
+	subprocess.run(f'rm -rf {downloads_path}', shell=True)
+
+	stop_service(local, "ton_storage")  # stop TS
+	disable_service(local, "ton_storage")
+
+	from mytoninstaller.mytoninstaller import set_node_argument
+
+	set_node_argument(local, ['--skip-key-sync'])
+	if block_to is not None:
+		set_node_argument(local, ['--sync-shards-upto', str(block_to)])
+
+	with open(local.buffer.global_config_path, 'r') as f:
+		c = json.loads(f.read())
+	if c['validator']['hardforks'] and c['validator']['hardforks'][-1]['seqno'] > block_from:
+		run_process_hardforks(local, block_from)
+
+	local.add_log(f"Changing permissions on imported files", "info")
+	subprocess.run(["chmod", "o+w", import_dir])
+	mconfig_path = local.buffer.mconfig_path
+	mconfig = GetConfig(path=mconfig_path)
+	mconfig.importGc = True
+	SetConfig(path=mconfig_path, data=mconfig)
+
+
+def run_process_hardforks(local, from_seqno: int):
+	script_path = os.path.join(local.buffer.mtc_src_dir, 'mytoninstaller', 'scripts', 'process_hardforks.py')
+	log_path = "/tmp/process_hardforks_logs.txt"
+	log_file = open(log_path, "a")
+
+	p = subprocess.Popen([
+	        "python3", script_path,
+	        "--from-seqno", str(from_seqno),
+	        "--config-path", local.buffer.global_config_path,
+	        # "--bin", local.buffer.ton_bin_dir + "validator-engine-console/validator-engine-console",
+	        # "--client", local.buffer.keys_dir + "client",
+	        # "--server", local.buffer.keys_dir + "server.pub",
+	        # "--address", "127.0.0.1:"
+	    ],
+		stdout=log_file,
+		stderr=log_file,
+		stdin=subprocess.DEVNULL,
+		start_new_session=True  # run in background
+	)
+	local.add_log(f"process_hardforks process is running in background, PID: {p.pid}, log file: {log_path}", "info")
+
 
 def DownloadDump(local):
     dump = local.buffer.dump
@@ -509,8 +732,9 @@ def do_enable_ton_http_api(local):
 	if not os.path.exists('/usr/bin/ton/local.config.json'):
 		from mytoninstaller.mytoninstaller import CreateLocalConfigFile
 		CreateLocalConfigFile(local, [])
+	user = local.buffer.user or get_current_user()
 	ton_http_api_installer_path = pkg_resources.resource_filename('mytoninstaller.scripts', 'ton_http_api_installer.sh')
-	exit_code = run_as_root(["bash", ton_http_api_installer_path])
+	exit_code = run_as_root(["bash", ton_http_api_installer_path, "-u", user])
 	if exit_code == 0:
 		text = "do_enable_ton_http_api - {green}OK{endc}"
 	else:
@@ -636,82 +860,11 @@ def enable_ton_storage(local):
 	local.add_log("write mconfig", "debug")
 	SetConfig(path=mconfig_path, data=mconfig)
 
+	local.buffer.ton_storage = ton_storage
+
 	# start ton_storage
 	start_service(local, bin_name)
 	color_print("enable_ton_storage - {green}OK{endc}")
-#end define
-
-def enable_ton_storage_provider(local):
-	local.add_log("start enable_ton_storage_provider function", "debug")
-	user = local.buffer.user
-	udp_port = random.randint(2000, 65000)
-	bin_name = "ton_storage_provider"
-	db_path = f"/var/{bin_name}"
-	bin_path = f"{db_path}/{bin_name}"
-	config_path = f"{db_path}/config.json"
-	network_config = "/usr/bin/ton/global.config.json"
-
-	installer_path = pkg_resources.resource_filename('mytoninstaller.scripts', 'ton_storage_provider_installer.sh')
-	local.add_log(f"Running script: {installer_path}", "debug")
-	exit_code = run_as_root(["bash", installer_path, "-u", user])
-	if exit_code != 0:
-		color_print("enable_ton_storage_provider - {red}Error{endc}")
-		raise Exception("enable_ton_storage_provider - Error")
-	#end if
-
-	# Прописать автозагрузку
-	start_cmd = f"{bin_path} -network-config {network_config}"
-	add2systemd(name=bin_name, user=user, start=start_cmd, workdir=db_path, force=True)
-
-	# Первый запуск - создание конфига
-	start_service(local, bin_name, sleep=10)
-	stop_service(local, bin_name)
-
-	# read mconfig
-	local.add_log("read mconfig", "debug")
-	mconfig_path = local.buffer.mconfig_path
-	mconfig = GetConfig(path=mconfig_path)
-
-	# read ton_storage_provider config
-	local.add_log("read ton_storage_provider config", "debug")
-	config = GetConfig(path=config_path)
-
-	# prepare config
-	config.ListenAddr = f"0.0.0.0:{udp_port}"
-	config.ExternalIP = get_own_ip()
-	config.Storages[0].BaseURL = f"http://127.0.0.1:{mconfig.ton_storage.api_port}"
-
-	# write ton_storage_provider config
-	local.add_log("write ton_storage_provider config", "debug")
-	SetConfig(path=config_path, data=config)
-
-	# backup config
-	backup_config(local, config_path)
-
-	# get provider pubkey
-	key_bytes = base64.b64decode(config.ProviderKey)
-	pubkey_bytes = key_bytes[32:64]
-
-	# edit mytoncore config file
-	local.add_log("edit mytoncore config file", "debug")
-	provider = Dict()
-	provider.udp_port = udp_port
-	provider.config_path = config_path
-	provider.pubkey = pubkey_bytes.hex()
-	mconfig.ton_storage.provider = provider
-
-	# write mconfig
-	local.add_log("write mconfig", "debug")
-	SetConfig(path=mconfig_path, data=mconfig)
-
-	# Подтянуть событие в mytoncore.py
-	cmd = 'python3 -m mytoncore -e "enable_ton_storage_provider"'
-	args = ["su", "-l", user, "-c", cmd]
-	subprocess.run(args)
-
-	# start ton_storage_provider
-	start_service(local, bin_name)
-	color_print("enable_ton_storage_provider - {green}OK{endc}")
 #end define
 
 def DangerousRecoveryValidatorConfigFile(local):
@@ -950,7 +1103,7 @@ def CreateSymlinks(local):
 
 def EnableMode(local):
 	args = ["python3", "-m", "mytoncore", "-e"]
-	if local.buffer.mode and local.buffer.mode != "none":
+	if local.buffer.mode and local.buffer.mode != "none" and not local.buffer.backup:
 		args.append("enable_mode_" + local.buffer.mode)
 	else:
 		return
@@ -983,10 +1136,10 @@ def ConfigureFromBackup(local):
 	os.makedirs(local.buffer.ton_work_dir, exist_ok=True)
 	if not local.buffer.only_mtc:
 		ip = str(ip2int(get_own_ip()))
-		BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file, "-i", ip])
+		BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file, "-i", ip], user=local.buffer.user)
 
 	if local.buffer.only_mtc:
-		BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file])
+		BackupModule.run_restore_backup(["-m", mconfig_dir, "-n", backup_file], user=local.buffer.user)
 		local.add_log("Installing only mtc", "info")
 		vconfig_path = local.buffer.vconfig_path
 		vconfig = GetConfig(path=vconfig_path)
@@ -997,6 +1150,10 @@ def ConfigureFromBackup(local):
 			return
 		set_external_ip(local, node_ip)
 
+	args = ["python3", "-m", "mytoncore", "-e", "enable_btc_teleport"]
+	args = ["su", "-l", local.buffer.user, "-c", ' '.join(args)]
+	subprocess.run(args)
+
 
 def ConfigureOnlyNode(local):
 	if not local.buffer.only_node:
@@ -1006,7 +1163,7 @@ def ConfigureOnlyNode(local):
 	mconfig_dir = get_dir_from_path(mconfig_path)
 	local.add_log("start ConfigureOnlyNode function", "info")
 
-	process = BackupModule.run_create_backup(["-m", mconfig_dir, ])
+	process = BackupModule.run_create_backup(["-m", mconfig_dir], user=local.buffer.user)
 	if process.returncode != 0:
 		local.add_log("Backup creation failed", "error")
 		return
@@ -1027,3 +1184,15 @@ def SetInitialSync(local):
 	SetConfig(path=mconfig_path, data=mconfig)
 
 	start_service(local, 'mytoncore')
+
+
+def SetupCollator(local):
+	if local.buffer.mode != "collator":
+		return
+	shards = local.buffer.collate_shard.split()
+	if not shards:
+		shards = ['0:8000000000000000']
+	local.add_log(f"Setting up collator for shards: {shards}", "info")
+	args = ["python3", "-m", "mytoncore", "-e", "setup_collator_" + '_'.join(shards)]
+	args = ["su", "-l", local.buffer.user, "-c", ' '.join(args)]
+	subprocess.run(args)

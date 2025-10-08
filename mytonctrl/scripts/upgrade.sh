@@ -16,14 +16,20 @@ bindir="/usr/bin/"
 tmpdir="/tmp/ton_src/"
 
 # Get arguments
-while getopts a:r:b: flag
+while getopts a:r:b:g: flag
 do
 	case "${flag}" in
 		a) author=${OPTARG};;
 		r) repo=${OPTARG};;
 		b) branch=${OPTARG};;
+    g) git_url=${OPTARG};;
 	esac
 done
+
+remote_url="https://github.com/${author}/${repo}.git"
+if [ -n "${git_url}" ]; then
+  remote_url="${git_url}"
+fi
 
 # Цвета
 COLOR='\033[92m'
@@ -63,8 +69,8 @@ fi
 rm -rf ${tmpdir}/${repo}
 mkdir -p ${tmpdir}/${repo}
 cd ${tmpdir}/${repo}
-echo "https://github.com/${author}/${repo}.git -> ${branch}"
-git clone --recursive https://github.com/${author}/${repo}.git . || exit 1
+echo "${remote_url} -> ${branch}"
+git clone --recursive ${remote_url} . || exit 1
 
 # Go to work dir
 cd ${srcdir}/${repo}
@@ -83,13 +89,13 @@ export CCACHE_DISABLE=1
 
 # Update binary
 cd ${bindir}/${repo}
-ls --hide=global.config.json | xargs -d '\n' rm -rf
+ls --hide="*.config.json" | xargs -d '\n' rm -rf
 rm -rf .ninja_*
 memory=$(cat /proc/meminfo | grep MemAvailable | awk '{print $2}')
 cpuNumber=$(cat /proc/cpuinfo | grep "processor" | wc -l)
 
 cmake -DCMAKE_BUILD_TYPE=Release ${srcdir}/${repo} -GNinja -DTON_USE_JEMALLOC=ON -DOPENSSL_FOUND=1 -DOPENSSL_INCLUDE_DIR=$opensslPath/include -DOPENSSL_CRYPTO_LIBRARY=$opensslPath/libcrypto.a
-ninja -j ${cpuNumber} fift validator-engine lite-client pow-miner validator-engine-console generate-random-id dht-server func tonlibjson rldp-http-proxy
+ninja -j ${cpuNumber} fift validator-engine lite-client validator-engine-console generate-random-id dht-server func tonlibjson rldp-http-proxy
 systemctl restart validator
 
 # Конец

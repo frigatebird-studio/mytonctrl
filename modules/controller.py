@@ -240,6 +240,11 @@ class ControllerModule(MtcModule):
             return
         self.ton.ControllerRecoverStake(controller_addr)
         color_print("recover stake - {green}OK{endc}")
+    
+    @classmethod
+    def check_enable(cls, ton: "MyTonCore"):
+        from mytoninstaller.settings import enable_ton_http_api
+        enable_ton_http_api(ton.local)
 
     def add_console_commands(self, console):
         console.AddItem("create_controllers", self.create_controllers, self.local.translate("_"))

@@ -11,11 +11,12 @@ import pkg_resources
 
 from mypylib.mypylib import MyPyClass, run_as_root, color_print
 from mypyconsole.mypyconsole import MyPyConsole
+from mytonctrl.utils import get_current_user, pop_user_from_args
 
 from mytoninstaller.config import GetLiteServerConfig, get_ls_proxy_config
 from mytoninstaller.node_args import get_node_args
 from mytoninstaller.utils import GetInitBlock
-from mytoncore.utils import dict2b64, str2bool, b642dict
+from mytoncore.utils import dict2b64, str2bool, b642dict, b642hex
 
 from mytoninstaller.settings import (
 	FirstNodeSettings,
@@ -29,8 +30,7 @@ from mytoninstaller.settings import (
 	CreateSymlinks,
 	enable_ls_proxy,
 	enable_ton_storage,
-	enable_ton_storage_provider,
-	EnableMode, ConfigureFromBackup, ConfigureOnlyNode, SetInitialSync
+	EnableMode, ConfigureFromBackup, ConfigureOnlyNode, SetInitialSync, SetupCollator
 )
 from mytoninstaller.config import (
 	CreateLocalConfig,
@@ -38,6 +38,18 @@ from mytoninstaller.config import (
 )
 
 from functools import partial
+
+
+def init_envs(local):
+	local.buffer.cport = int(os.getenv('VALIDATOR_CONSOLE_PORT', random.randint(2000, 65000)))
+	local.buffer.lport = int(os.getenv('LITESERVER_PORT', random.randint(2000, 65000)))
+	local.buffer.vport = int(os.getenv('VALIDATOR_PORT', random.randint(2000, 65000)))
+	local.buffer.archive_ttl = os.getenv('ARCHIVE_TTL')
+	local.buffer.state_ttl = os.getenv('STATE_TTL')
+	local.buffer.public_ip = os.getenv('PUBLIC_IP')
+	local.buffer.add_shard = os.getenv('ADD_SHARD')
+	local.buffer.archive_blocks = os.getenv('ARCHIVE_BLOCKS')
+	local.buffer.collate_shard = os.getenv('COLLATE_SHARD', '')
 
 
 def Init(local, console):
@@ -49,11 +61,9 @@ def Init(local, console):
 
 
 	# create variables
-	user = os.environ.get("USER", "root")
-	local.buffer.user = user
+	local.buffer.user = get_current_user()
 	local.buffer.vuser = "validator"
-	local.buffer.cport = random.randint(2000, 65000)
-	local.buffer.lport = random.randint(2000, 65000)
+	init_envs(local)
 
 	# this funciton injects MyPyClass instance
 	def inject_globals(func):
@@ -69,7 +79,7 @@ def Init(local, console):
 	console.AddItem("status", inject_globals(Status), "Print TON component status")
 	console.AddItem("set_node_argument", inject_globals(set_node_argument), "Set node argument")
 	console.AddItem("enable", inject_globals(Enable), "Enable some function")
-	console.AddItem("update", inject_globals(Enable), "Update some function: 'JR' - jsonrpc.  Example: 'update JR'") 
+	console.AddItem("update", inject_globals(Enable), "Update some function: 'JR' - jsonrpc.  Example: 'update JR'")
 	console.AddItem("plsc", inject_globals(PrintLiteServerConfig), "Print lite-server config")
 	console.AddItem("clcf", inject_globals(CreateLocalConfigFile), "Create lite-server config file")
 	console.AddItem("print_ls_proxy_config", inject_globals(print_ls_proxy_config), "Print ls-proxy config")
@@ -94,11 +104,13 @@ def Refresh(local):
 	ton_work_dir = "/var/ton-work/"
 	ton_bin_dir = bin_dir + "ton/"
 	ton_src_dir = src_dir + "ton/"
+	mtc_src_dir = src_dir + "mytonctrl/"
 	local.buffer.bin_dir = bin_dir
 	local.buffer.src_dir = src_dir
 	local.buffer.ton_work_dir = ton_work_dir
 	local.buffer.ton_bin_dir = ton_bin_dir
 	local.buffer.ton_src_dir = ton_src_dir
+	local.buffer.mtc_src_dir = mtc_src_dir
 	ton_db_dir = ton_work_dir + "db/"
 	keys_dir = ton_work_dir + "keys/"
 	local.buffer.ton_db_dir = ton_db_dir
@@ -132,6 +144,8 @@ def Status(local, args):
 	node_args = get_node_args()
 	color_print("{cyan}===[ Node arguments ]==={endc}")
 	for key, value in node_args.items():
+		if len(value) == 0:
+			print(f"{key}")
 		for v in value:
 			print(f"{key}: {v}")
 #end define
@@ -162,7 +176,7 @@ def Enable(local, args):
 		print("'JR' - jsonrpc")
 		print("'THA' - ton-http-api")
 		print("'LSP' - ls-proxy")
-		print("'TSP' - ton-storage + ton-storage-provider")
+		print("'TS' - ton-storage")
 		print("Example: 'enable FN'")
 		return
 	if name == "THA":
@@ -193,10 +207,21 @@ def PrintLiteServerConfig(local, args):
 
 
 def CreateLocalConfigFile(local, args):
-	initBlock = GetInitBlock()
-	initBlock_b64 = dict2b64(initBlock)
-	user = local.buffer.user or os.environ.get("USER", "root")
-	args = ["python3", "-m", "mytoninstaller", "-u", user, "-e", "clc", "-i", initBlock_b64]
+	init_block = GetInitBlock()
+	if init_block['rootHash'] is None:
+		local.add_log("Failed to get recent init block. Using init block from global config.", "warning")
+		with open('/usr/bin/ton/global.config.json', 'r') as f:
+			config = json.load(f)
+		config_init_block = config['validator']['init_block']
+		init_block = dict()
+		init_block["seqno"] = config_init_block['seqno']
+		init_block["rootHash"] = b642hex(config_init_block['root_hash'])
+		init_block["fileHash"] = b642hex(config_init_block['file_hash'])
+	init_block_b64 = dict2b64(init_block)
+	user = pop_user_from_args(args)
+	if user is None:
+		user = local.buffer.user or get_current_user()
+	args = ["python3", "-m", "mytoninstaller", "-u", user, "-e", "clc", "-i", init_block_b64]
 	run_as_root(args)
 #end define
 
@@ -227,9 +252,8 @@ def Event(local, name):
 		enable_ton_http_api(local)
 	if name == "enableLSP":
 		enable_ls_proxy(local)
-	if name == "enableTSP":
+	if name == "enableTS":
 		enable_ton_storage(local)
-		enable_ton_storage_provider(local)
 	if name == "clc":
 		ix = sys.argv.index("-i")
 		initBlock_b64 = sys.argv[ix+1]
@@ -301,6 +325,7 @@ def General(local, console):
 	ConfigureFromBackup(local)
 	ConfigureOnlyNode(local)
 	SetInitialSync(local)
+	SetupCollator(local)
 #end define
 
 

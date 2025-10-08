@@ -45,7 +45,8 @@ from mytoncore.functions import (
 )
 from mytoncore.telemetry import is_host_virtual
 from mytonctrl.migrate import run_migrations
-from mytonctrl.utils import GetItemFromList, timestamp2utcdatetime, fix_git_config, is_hex, GetColorInt
+from mytonctrl.utils import GetItemFromList, timestamp2utcdatetime, fix_git_config, is_hex, GetColorInt, \
+	pop_user_from_args, pop_arg_from_args
 
 import sys, getopt, os
 
@@ -100,13 +101,13 @@ def Init(local, ton, console, argv):
 	module = CustomOverlayModule(ton, local)
 	module.add_console_commands(console)
 
+	from modules.btc_teleport import BtcTeleportModule
+	module = BtcTeleportModule(ton, local)
+	module.add_console_commands(console)
+
 	if ton.using_validator():
 		from modules.validator import ValidatorModule
 		module = ValidatorModule(ton, local)
-		module.add_console_commands(console)
-
-		from modules.collator_config import CollatorConfigModule
-		module = CollatorConfigModule(ton, local)
 		module.add_console_commands(console)
 
 		from modules.wallet import WalletModule
@@ -137,13 +138,22 @@ def Init(local, ton, console, argv):
 			module = ControllerModule(ton, local)
 			module.add_console_commands(console)
 
+	if ton.using_validator() or ton.using_collator():
+		from modules.collator_config import CollatorConfigModule
+		module = CollatorConfigModule(ton, local)
+		module.add_console_commands(console)
+
+	if ton.using_collator():
+		from modules.collator import CollatorModule
+		module = CollatorModule(ton, local)
+		module.add_console_commands(console)
+
 	if ton.using_alert_bot():
 		from modules.alert_bot import AlertBotModule
 		module = AlertBotModule(ton, local)
 		module.add_console_commands(console)
 
 	console.AddItem("benchmark", inject_globals(run_benchmark), local.translate("benchmark_cmd"))
-	# console.AddItem("activate_ton_storage_provider", inject_globals(activate_ton_storage_provider), local.translate("activate_ton_storage_provider_cmd"))
 
 	# Process input parameters
 	opts, args = getopt.getopt(argv,"hc:w:",["config=","wallets="])
@@ -173,23 +183,6 @@ def Init(local, ton, console, argv):
 	local.db.config.logLevel = "debug" if console.debug else "info"
 	local.db.config.isLocaldbSaving = False
 	local.run()
-#end define
-
-
-def activate_ton_storage_provider(local, ton, args):
-	wallet_name = "provider_wallet_001"
-	wallet = ton.GetLocalWallet(wallet_name)
-	account = ton.GetAccount(wallet.addrB64)
-	if account.status == "active":
-		color_print("activate_ton_storage_provider - {green}Already activated{endc}")
-		#return
-	ton.ActivateWallet(wallet)
-	destination = "0:7777777777777777777777777777777777777777777777777777777777777777"
-	ton_storage = ton.GetSettings("ton_storage")
-	comment = f"tsp-{ton_storage.provider.pubkey}"
-	flags = ["-n", "-C", comment]
-	ton.MoveCoins(wallet, destination, 0.01, flags=flags)
-	color_print("activate_ton_storage_provider - {green}OK{endc}")
 #end define
 
 
@@ -287,7 +280,22 @@ def check_git(input_args, default_repo, text, default_branch='master'):
 	fix_git_config(git_path)
 	default_author = "ton-blockchain"
 
-	# Get author, repo, branch
+	branch = pop_arg_from_args(input_args, '--branch')
+
+	if '--url' in input_args:
+		git_url = pop_arg_from_args(input_args, '--url')
+		if branch is None:
+			if '#' in git_url:
+				ref_fragment = git_url.rsplit('#', 1)[1]
+				if not ref_fragment:
+					raise Exception("--url fragment after # is empty")
+				branch = ref_fragment
+			else:
+				branch = default_branch
+		if '#' in git_url:
+			git_url = git_url.split('#', 1)[0]
+		return None, None, branch, git_url
+
 	local_author, local_repo = get_git_author_and_repo(git_path)
 	local_branch = get_git_branch(git_path)
 
@@ -295,7 +303,7 @@ def check_git(input_args, default_repo, text, default_branch='master'):
 	data = GetAuthorRepoBranchFromArgs(input_args)
 	need_author = data.get("author")
 	need_repo = data.get("repo")
-	need_branch = data.get("branch")
+	need_branch = data.get("branch") or branch
 
 	# Check if remote repo is different from default
 	if ((need_author is None and local_author != default_author) or
@@ -313,7 +321,7 @@ def check_git(input_args, default_repo, text, default_branch='master'):
 	if need_branch is None:
 		need_branch = local_branch
 	check_branch_exists(need_author, need_repo, need_branch)
-	return need_author, need_repo, need_branch
+	return need_author, need_repo, need_branch, None
 #end define
 
 def check_branch_exists(author, repo, branch):
@@ -330,8 +338,7 @@ def check_branch_exists(author, repo, branch):
 
 def Update(local, args):
 	repo = "mytonctrl"
-	author, repo, branch = check_git(args, repo, "update")
-
+	author, repo, branch, _ = check_git(args, repo, "update")  # todo: implement --url for update
 	# Run script
 	update_script_path = pkg_resources.resource_filename('mytonctrl', 'scripts/update.sh')
 	runArgs = ["bash", update_script_path, "-a", author, "-r", repo, "-b", branch]
@@ -344,9 +351,16 @@ def Update(local, args):
 	local.exit()
 #end define
 
-def Upgrade(ton, args):
-	repo = "ton"
-	author, repo, branch = check_git(args, repo, "upgrade")
+def Upgrade(local, ton, args: list):
+	if '--btc-teleport' in args:  # upgrade --btc-teleport [branch] [-u <user>]
+		branch = 'master'
+		user = pop_user_from_args(args)
+		if len(args) > args.index('--btc-teleport') + 1:
+			branch = args[args.index('--btc-teleport') + 1]
+		upgrade_btc_teleport(local, ton, reinstall=True, branch=branch, user=user)
+		return
+
+	author, repo, branch, git_url = check_git(args, default_repo="ton", text="upgrade")
 
 	# bugfix if the files are in the wrong place
 	liteClient = ton.GetSettings("liteClient")
@@ -366,16 +380,68 @@ def Upgrade(ton, args):
 		validatorConsole["pubKeyPath"] = "/var/ton-work/keys/server.pub"
 	ton.SetSettings("validatorConsole", validatorConsole)
 
+	clang_version = get_clang_major_version()
+	if clang_version is None or clang_version < 16:
+		text = f"{{red}}WARNING: THIS UPGRADE WILL MOST PROBABLY FAIL DUE TO A WRONG CLANG VERSION: {clang_version}, REQUIRED VERSION IS 16. RECOMMENDED TO EXIT NOW AND UPGRADE CLANG AS PER INSTRUCTIONS: https://gist.github.com/neodix42/e4b1b68d2d5dd3dec75b5221657f05d7{{endc}}\n"
+		color_print(text)
+		if input("Continue with upgrade anyway? [Y/n]\n").strip().lower() not in ('y', ''):
+			print('aborted.')
+			return
+
 	# Run script
 	upgrade_script_path = pkg_resources.resource_filename('mytonctrl', 'scripts/upgrade.sh')
-	runArgs = ["bash", upgrade_script_path, "-a", author, "-r", repo, "-b", branch]
+	if git_url:
+		runArgs = ["bash", upgrade_script_path, "-g", git_url, "-b", branch]
+	else:
+		runArgs = ["bash", upgrade_script_path, "-a", author, "-r", repo, "-b", branch]
+
 	exitCode = run_as_root(runArgs)
+	if ton.using_validator():
+		upgrade_btc_teleport(local, ton)
 	if exitCode == 0:
 		text = "Upgrade - {green}OK{endc}"
 	else:
 		text = "Upgrade - {red}Error{endc}"
 	color_print(text)
 #end define
+
+
+def upgrade_btc_teleport(local, ton, reinstall=False, branch: str = 'master', user = None):
+	from modules.btc_teleport import BtcTeleportModule
+	module = BtcTeleportModule(ton, local)
+	local.try_function(module.init, args=[reinstall, branch, user])
+
+
+def get_clang_major_version():
+	try:
+		process = subprocess.run(["clang", "--version"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+								 text=True, timeout=3)
+		if process.returncode != 0:
+			return None
+
+		output = process.stdout
+
+		lines = output.strip().split('\n')
+		if not lines:
+			return None
+
+		first_line = lines[0]
+		if "clang version" not in first_line:
+			return None
+
+		version_part = first_line.split("clang version")[1].strip()
+		major_version = version_part.split('.')[0]
+
+		major_version = ''.join(c for c in major_version if c.isdigit())
+
+		if not major_version:
+			return None
+
+		return int(major_version)
+	except Exception as e:
+		print(f"Error checking clang version: {type(e)}: {e}")
+		return None
+
 
 def rollback_to_mtc1(local, ton,  args):
 	color_print("{red}Warning: this is dangerous, please make sure you've backed up mytoncore's db.{endc}")
@@ -505,6 +571,7 @@ def warnings(local, ton):
 	local.try_function(check_slashed, args=[local, ton])
 #end define
 
+
 def CheckTonUpdate(local):
 	git_path = "/usr/src/ton"
 	result = check_git_update(git_path)
@@ -569,7 +636,7 @@ def PrintStatus(local, ton, args):
 
 	if all_status:
 		network_name = ton.GetNetworkName()
-		rootWorkchainEnabledTime_int = ton.GetRootWorkchainEnabledTime()
+		rootWorkchainEnabledTime_int = local.try_function(ton.GetRootWorkchainEnabledTime)
 		config34 = ton.GetConfig34()
 		config36 = ton.GetConfig36()
 		totalValidators = config34["totalValidators"]
@@ -592,8 +659,8 @@ def PrintStatus(local, ton, args):
 		startWorkTime = ton.GetActiveElectionId(fullElectorAddr)
 		validator_index = ton.GetValidatorIndex()
 
-		offersNumber = ton.GetOffersNumber()
-		complaintsNumber = ton.GetComplaintsNumber()
+		offersNumber = local.try_function(ton.GetOffersNumber)
+		complaintsNumber = local.try_function(ton.GetComplaintsNumber)
 
 		tpsAvg = ton.GetStatistics("tpsAvg", statistics)
 
@@ -615,10 +682,10 @@ def PrintTonStatus(local, network_name, startWorkTime, totalValidators, onlineVa
 	#tps5 = tpsAvg[1]
 	#tps15 = tpsAvg[2]
 	allValidators = totalValidators
-	newOffers = offersNumber.get("new")
-	allOffers = offersNumber.get("all")
-	newComplaints = complaintsNumber.get("new")
-	allComplaints = complaintsNumber.get("all")
+	newOffers = offersNumber.get("new") if offersNumber else 'n/a'
+	allOffers = offersNumber.get("all") if offersNumber else 'n/a'
+	newComplaints = complaintsNumber.get("new") if complaintsNumber else 'n/a'
+	allComplaints = complaintsNumber.get("all") if complaintsNumber else 'n/a'
 	#tps1_text = bcolors.green_text(tps1)
 	#tps5_text = bcolors.green_text(tps5)
 	#tps15_text = bcolors.green_text(tps15)
@@ -732,6 +799,14 @@ def PrintLocalStatus(local, ton, adnlAddr, validatorIndex, validatorEfficiency, 
 	validatorStatus_color = GetColorStatus(validatorStatus_bool)
 	mytoncoreStatus_text = local.translate("local_status_mytoncore_status").format(mytoncoreStatus_color, mytoncoreUptime_text)
 	validatorStatus_text = local.translate("local_status_validator_status").format(validatorStatus_color, validatorUptime_text)
+	btc_teleport_status_text = None
+	if ton.using_validator():
+		btc_teleport_status_bool = get_service_status("btc_teleport")
+		btc_teleport_status_uptime = get_service_uptime("btc_teleport")
+		btc_teleport_status_text = local.translate("local_status_btc_teleport_status").format(
+			GetColorStatus(btc_teleport_status_bool),
+			bcolors.green_text(time2human(btc_teleport_status_uptime)) if btc_teleport_status_bool else 'n/a'
+		)
 
 	validator_initial_sync_text = ''
 	validator_out_of_sync_text = ''
@@ -754,23 +829,25 @@ def PrintLocalStatus(local, ton, adnlAddr, validatorIndex, validatorEfficiency, 
 
 	active_validator_groups = None
 
-	if ton.using_validator() and validator_status.validator_groups_master and validator_status.validator_groups_shard:
+	if ton.using_validator() and validator_status.validator_groups_master is not None and validator_status.validator_groups_shard is not None:
 		active_validator_groups = local.translate("active_validator_groups").format(validator_status.validator_groups_master, validator_status.validator_groups_shard)
 
 	collated, validated = None, None
 	ls_queries = None
-	if ton.using_validator():
-		node_stats = ton.get_node_statistics()
-		if node_stats and 'collated' in node_stats and 'validated' in node_stats:
-			collated = local.translate('collated_blocks').format(node_stats['collated']['ok'], node_stats['collated']['error'])
-			validated = local.translate('validated_blocks').format(node_stats['validated']['ok'], node_stats['validated']['error'])
-		else:
-			collated = local.translate('collated_blocks').format('collecting data...', 'wait for the next validation round')
-			validated = local.translate('validated_blocks').format('collecting data...', 'wait for the next validation round')
-	if ton.using_liteserver():
-		node_stats = ton.get_node_statistics()
-		if node_stats and 'ls_queries' in node_stats:
-			ls_queries = local.translate('ls_queries').format(node_stats['ls_queries']['time'], node_stats['ls_queries']['ok'], node_stats['ls_queries']['error'])
+	node_stats = local.try_function(ton.get_node_statistics)
+	if node_stats is not None:
+		if ton.using_validator():
+			if 'collated' in node_stats and 'validated' in node_stats:
+				collated = local.translate('collated_blocks').format(node_stats['collated']['ok'], node_stats['collated']['error'])
+				validated = local.translate('validated_blocks').format(node_stats['validated']['ok'], node_stats['validated']['error'])
+			else:
+				collated = local.translate('collated_blocks').format('collecting data...', 'wait for the next validation round')
+				validated = local.translate('validated_blocks').format('collecting data...', 'wait for the next validation round')
+		if ton.using_liteserver():
+			if 'ls_queries' in node_stats:
+				ls_queries = local.translate('ls_queries').format(node_stats['ls_queries']['time'], node_stats['ls_queries']['ok'], node_stats['ls_queries']['error'])
+	else:
+		local.add_log("Failed to get node statistics", "warning")
 
 	dbSize_text = GetColorInt(dbSize, 1000, logic="less", ending=" Gb")
 	dbUsage_text = GetColorInt(dbUsage, 80, logic="less", ending="%")
@@ -780,8 +857,18 @@ def PrintLocalStatus(local, ton, adnlAddr, validatorIndex, validatorEfficiency, 
 	mtcGitPath = "/usr/src/mytonctrl"
 	validatorGitPath = "/usr/src/ton"
 	validatorBinGitPath = "/usr/bin/ton/validator-engine/validator-engine"
+	btc_teleport_path = "/usr/src/ton-teleport-btc-periphery/"
 	mtcGitHash = get_git_hash(mtcGitPath, short=True)
 	validatorGitHash = GetBinGitHash(validatorBinGitPath, short=True)
+	btc_teleport_git_hash = None
+	btc_teleport_git_branch = None
+	if ton.using_validator():
+		if os.path.exists(btc_teleport_path):
+			btc_teleport_git_hash = get_git_hash(btc_teleport_path, short=True)
+			btc_teleport_git_branch = get_git_branch(btc_teleport_path)
+		else:
+			btc_teleport_git_hash = "n/a"
+			btc_teleport_git_branch = "n/a"
 	fix_git_config(mtcGitPath)
 	fix_git_config(validatorGitPath)
 	mtcGitBranch = get_git_branch(mtcGitPath)
@@ -792,8 +879,15 @@ def PrintLocalStatus(local, ton, adnlAddr, validatorIndex, validatorEfficiency, 
 	validatorGitBranch_text = bcolors.yellow_text(validatorGitBranch)
 	mtcVersion_text = local.translate("local_status_version_mtc").format(mtcGitHash_text, mtcGitBranch_text)
 	validatorVersion_text = local.translate("local_status_version_validator").format(validatorGitHash_text, validatorGitBranch_text)
+	btc_teleport_version_text = None
+	if btc_teleport_git_hash:
+		btc_teleport_git_hash_text = bcolors.yellow_text(btc_teleport_git_hash)
+		btc_teleport_git_branch_text = bcolors.yellow_text(btc_teleport_git_branch)
+		btc_teleport_version_text = local.translate("local_status_version_teleport").format(btc_teleport_git_hash_text, btc_teleport_git_branch_text)
 
 	color_print(local.translate("local_status_head"))
+	node_mode = ton.get_node_mode()
+	color_print(local.translate("node_mode").format(node_mode))
 	node_ip = ton.get_validator_engine_ip()
 	is_node_remote = node_ip != '127.0.0.1'
 	if is_node_remote:
@@ -815,6 +909,8 @@ def PrintLocalStatus(local, ton, adnlAddr, validatorIndex, validatorEfficiency, 
 	print(mytoncoreStatus_text)
 	if not is_node_remote:
 		print(validatorStatus_text)
+	if btc_teleport_status_text:
+		print(btc_teleport_status_text)
 	if validator_initial_sync_text:
 		print(validator_initial_sync_text)
 	if validator_out_of_sync_text:
@@ -833,6 +929,8 @@ def PrintLocalStatus(local, ton, adnlAddr, validatorIndex, validatorEfficiency, 
 	print(dbStatus_text)
 	print(mtcVersion_text)
 	print(validatorVersion_text)
+	if btc_teleport_version_text:
+		print(btc_teleport_version_text)
 	print()
 #end define
 
